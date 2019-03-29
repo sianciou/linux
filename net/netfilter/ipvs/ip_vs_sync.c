@@ -425,16 +425,6 @@ ip_vs_sync_buff_create_v0(struct netns_ipvs *ipvs)
 	return sb;
 }
 
-/* Check if connection is controlled by persistence */
-static inline bool in_persistence(struct ip_vs_conn *cp)
-{
-	for (cp = cp->control; cp; cp = cp->control) {
-		if (cp->flags & IP_VS_CONN_F_TEMPLATE)
-			return true;
-	}
-	return false;
-}
-
 /* Check if conn should be synced.
  * pkts: conn packets, use sysctl_sync_threshold to avoid packet check
  * - (1) sync_refresh_period: reduce sync rate. Additionally, retry
@@ -457,8 +447,6 @@ static int ip_vs_sync_conn_needed(struct netns_ipvs *ipvs,
 	/* Check if we sync in current state */
 	if (unlikely(cp->flags & IP_VS_CONN_F_TEMPLATE))
 		force = 0;
-	else if (unlikely(sysctl_sync_persist_mode(ipvs) && in_persistence(cp)))
-		return 0;
 	else if (likely(cp->protocol == IPPROTO_TCP)) {
 		if (!((1 << cp->state) &
 		      ((1 << IP_VS_TCP_S_ESTABLISHED) |
@@ -473,10 +461,9 @@ static int ip_vs_sync_conn_needed(struct netns_ipvs *ipvs,
 	} else if (unlikely(cp->protocol == IPPROTO_SCTP)) {
 		if (!((1 << cp->state) &
 		      ((1 << IP_VS_SCTP_S_ESTABLISHED) |
-		       (1 << IP_VS_SCTP_S_SHUTDOWN_SENT) |
-		       (1 << IP_VS_SCTP_S_SHUTDOWN_RECEIVED) |
-		       (1 << IP_VS_SCTP_S_SHUTDOWN_ACK_SENT) |
-		       (1 << IP_VS_SCTP_S_CLOSED))))
+		       (1 << IP_VS_SCTP_S_CLOSED) |
+		       (1 << IP_VS_SCTP_S_SHUT_ACK_CLI) |
+		       (1 << IP_VS_SCTP_S_SHUT_ACK_SER))))
 			return 0;
 		force = cp->state != cp->old_state;
 		if (force && cp->state != IP_VS_SCTP_S_ESTABLISHED)
@@ -612,7 +599,7 @@ static void ip_vs_sync_conn_v0(struct net *net, struct ip_vs_conn *cp,
 			pkts = atomic_add_return(1, &cp->in_pkts);
 		else
 			pkts = sysctl_sync_threshold(ipvs);
-		ip_vs_sync_conn(net, cp, pkts);
+		ip_vs_sync_conn(net, cp->control, pkts);
 	}
 }
 
@@ -820,8 +807,7 @@ ip_vs_conn_fill_param_sync(struct net *net, int af, union ip_vs_sync_conn *sc,
 
 		p->pe_data = kmemdup(pe_data, pe_data_len, GFP_ATOMIC);
 		if (!p->pe_data) {
-			if (p->pe->module)
-				module_put(p->pe->module);
+			module_put(p->pe->module);
 			return -ENOMEM;
 		}
 		p->pe_data_len = pe_data_len;
@@ -846,10 +832,27 @@ static void ip_vs_proc_conn(struct net *net, struct ip_vs_conn_param *param,
 	struct ip_vs_conn *cp;
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
-	if (!(flags & IP_VS_CONN_F_TEMPLATE))
+	if (!(flags & IP_VS_CONN_F_TEMPLATE)) {
 		cp = ip_vs_conn_in_get(param);
-	else
+		if (cp && ((cp->dport != dport) ||
+			   !ip_vs_addr_equal(cp->af, &cp->daddr, daddr))) {
+			if (!(flags & IP_VS_CONN_F_INACTIVE)) {
+				ip_vs_conn_expire_now(cp);
+				__ip_vs_conn_put(cp);
+				cp = NULL;
+			} else {
+				/* This is the expiration message for the
+				 * connection that was already replaced, so we
+				 * just ignore it.
+				 */
+				__ip_vs_conn_put(cp);
+				kfree(param->pe_data);
+				return;
+			}
+		}
+	} else {
 		cp = ip_vs_ct_in_get(param);
+	}
 
 	if (cp) {
 		/* Free pe_data */
@@ -891,8 +894,6 @@ static void ip_vs_proc_conn(struct net *net, struct ip_vs_conn_param *param,
 			IP_VS_DBG(2, "BACKUP, add new conn. failed\n");
 			return;
 		}
-		if (!(flags & IP_VS_CONN_F_TEMPLATE))
-			kfree(param->pe_data);
 	}
 
 	if (opt)
@@ -1166,7 +1167,6 @@ static inline int ip_vs_proc_sync_conn(struct net *net, __u8 *p, __u8 *msg_end)
 				(opt_flags & IPVS_OPT_F_SEQ_DATA ? &opt : NULL)
 				);
 #endif
-	ip_vs_pe_put(param.pe);
 	return 0;
 	/* Error exit */
 out:
@@ -1383,9 +1383,11 @@ join_mcast_group(struct sock *sk, struct in_addr *addr, char *ifname)
 
 	mreq.imr_ifindex = dev->ifindex;
 
+	rtnl_lock();
 	lock_sock(sk);
 	ret = ip_mc_join_group(sk, &mreq);
 	release_sock(sk);
+	rtnl_unlock();
 
 	return ret;
 }
@@ -1640,12 +1642,12 @@ static int sync_thread_master(void *data)
 			continue;
 		}
 		while (ip_vs_send_sync_msg(tinfo->sock, sb->mesg) < 0) {
-			/* (Ab)use interruptible sleep to avoid increasing
-			 * the load avg.
-			 */
+			int ret = 0;
+
 			__wait_event_interruptible(*sk_sleep(sk),
 						   sock_writeable(sk) ||
-						   kthread_should_stop());
+						   kthread_should_stop(),
+						   ret);
 			if (unlikely(kthread_should_stop()))
 				goto done;
 		}
@@ -1738,9 +1740,8 @@ int start_sync_thread(struct net *net, int state, char *mcast_ifn, __u8 syncid)
 		if (ipvs->ms)
 			return -EEXIST;
 
-		if (strscpy(ipvs->master_mcast_ifn, mcast_ifn,
-			    sizeof(ipvs->master_mcast_ifn)) <= 0)
-			return -EINVAL;
+		strlcpy(ipvs->master_mcast_ifn, mcast_ifn,
+			sizeof(ipvs->master_mcast_ifn));
 		ipvs->master_syncid = syncid;
 		name = "ipvs-m:%d:%d";
 		threadfn = sync_thread_master;
@@ -1748,9 +1749,8 @@ int start_sync_thread(struct net *net, int state, char *mcast_ifn, __u8 syncid)
 		if (ipvs->backup_threads)
 			return -EEXIST;
 
-		if (strscpy(ipvs->backup_mcast_ifn, mcast_ifn,
-			    sizeof(ipvs->backup_mcast_ifn)) <= 0)
-			return -EINVAL;
+		strlcpy(ipvs->backup_mcast_ifn, mcast_ifn,
+			sizeof(ipvs->backup_mcast_ifn));
 		ipvs->backup_syncid = syncid;
 		name = "ipvs-b:%d:%d";
 		threadfn = sync_thread_backup;

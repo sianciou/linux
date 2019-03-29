@@ -13,13 +13,13 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/module.h>
 #include <linux/kernel.h>
 
-#include <linux/capability.h>
 #include <linux/if.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
@@ -70,9 +70,6 @@ static int xt_osf_add_callback(struct sock *ctnl, struct sk_buff *skb,
 	struct xt_osf_finger *kf = NULL, *sf;
 	int err = 0;
 
-	if (!capable(CAP_NET_ADMIN))
-		return -EPERM;
-
 	if (!osf_attrs[OSF_ATTR_FINGER])
 		return -EINVAL;
 
@@ -115,9 +112,6 @@ static int xt_osf_remove_callback(struct sock *ctnl, struct sk_buff *skb,
 	struct xt_osf_user_finger *f;
 	struct xt_osf_finger *sf;
 	int err = -ENOENT;
-
-	if (!capable(CAP_NET_ADMIN))
-		return -EPERM;
 
 	if (!osf_attrs[OSF_ATTR_FINGER])
 		return -EINVAL;
@@ -429,6 +423,4 @@ module_exit(xt_osf_fini);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Evgeniy Polyakov <zbr@ioremap.net>");
 MODULE_DESCRIPTION("Passive OS fingerprint matching.");
-MODULE_ALIAS("ipt_osf");
-MODULE_ALIAS("ip6t_osf");
 MODULE_ALIAS_NFNL_SUBSYS(NFNL_SUBSYS_OSF);

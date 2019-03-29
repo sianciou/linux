@@ -460,35 +460,27 @@ static inline void
 __ip_vs_bind_svc(struct ip_vs_dest *dest, struct ip_vs_service *svc)
 {
 	atomic_inc(&svc->refcnt);
-	rcu_assign_pointer(dest->svc, svc);
+	dest->svc = svc;
 }
 
 static void ip_vs_service_free(struct ip_vs_service *svc)
 {
-	if (svc->stats.cpustats)
-		free_percpu(svc->stats.cpustats);
+	free_percpu(svc->stats.cpustats);
 	kfree(svc);
 }
 
-static void ip_vs_service_rcu_free(struct rcu_head *head)
+static void
+__ip_vs_unbind_svc(struct ip_vs_dest *dest)
 {
-	struct ip_vs_service *svc;
+	struct ip_vs_service *svc = dest->svc;
 
-	svc = container_of(head, struct ip_vs_service, rcu_head);
-	ip_vs_service_free(svc);
-}
-
-static void __ip_vs_svc_put(struct ip_vs_service *svc, bool do_delay)
-{
+	dest->svc = NULL;
 	if (atomic_dec_and_test(&svc->refcnt)) {
 		IP_VS_DBG_BUF(3, "Removing service %u/%s:%u\n",
 			      svc->fwmark,
 			      IP_VS_DBG_ADDR(svc->af, &svc->addr),
 			      ntohs(svc->port));
-		if (do_delay)
-			call_rcu(&svc->rcu_head, ip_vs_service_rcu_free);
-		else
-			ip_vs_service_free(svc);
+		ip_vs_service_free(svc);
 	}
 }
 
@@ -674,6 +666,11 @@ ip_vs_trash_get_dest(struct ip_vs_service *svc, const union nf_inet_addr *daddr,
 			      IP_VS_DBG_ADDR(svc->af, &dest->addr),
 			      ntohs(dest->port),
 			      atomic_read(&dest->refcnt));
+		/* We can not reuse dest while in grace period
+		 * because conns still can use dest->svc
+		 */
+		if (test_bit(IP_VS_DEST_STATE_REMOVING, &dest->state))
+			continue;
 		if (dest->af == svc->af &&
 		    ip_vs_addr_equal(svc->af, &dest->addr, daddr) &&
 		    dest->port == dport &&
@@ -699,12 +696,10 @@ out:
 
 static void ip_vs_dest_free(struct ip_vs_dest *dest)
 {
-	struct ip_vs_service *svc = rcu_dereference_protected(dest->svc, 1);
-
 	__ip_vs_dst_cache_reset(dest);
-	__ip_vs_svc_put(svc, false);
+	__ip_vs_unbind_svc(dest);
 	free_percpu(dest->stats.cpustats);
-	ip_vs_dest_put_and_free(dest);
+	kfree(dest);
 }
 
 /*
@@ -775,7 +770,6 @@ __ip_vs_update_dest(struct ip_vs_service *svc, struct ip_vs_dest *dest,
 		    struct ip_vs_dest_user_kern *udest, int add)
 {
 	struct netns_ipvs *ipvs = net_ipvs(svc->net);
-	struct ip_vs_service *old_svc;
 	struct ip_vs_scheduler *sched;
 	int conn_flags;
 
@@ -797,14 +791,13 @@ __ip_vs_update_dest(struct ip_vs_service *svc, struct ip_vs_dest *dest,
 	atomic_set(&dest->conn_flags, conn_flags);
 
 	/* bind the service */
-	old_svc = rcu_dereference_protected(dest->svc, 1);
-	if (!old_svc) {
+	if (!dest->svc) {
 		__ip_vs_bind_svc(dest, svc);
 	} else {
-		if (old_svc != svc) {
+		if (dest->svc != svc) {
+			__ip_vs_unbind_svc(dest);
 			ip_vs_zero_stats(&dest->stats);
 			__ip_vs_bind_svc(dest, svc);
-			__ip_vs_svc_put(old_svc, true);
 		}
 	}
 
@@ -843,7 +836,7 @@ ip_vs_new_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest,
 	       struct ip_vs_dest **dest_p)
 {
 	struct ip_vs_dest *dest;
-	unsigned int atype, i;
+	unsigned int atype;
 
 	EnterFunction(2);
 
@@ -869,12 +862,6 @@ ip_vs_new_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest,
 	dest->stats.cpustats = alloc_percpu(struct ip_vs_cpu_stats);
 	if (!dest->stats.cpustats)
 		goto err_alloc;
-
-	for_each_possible_cpu(i) {
-		struct ip_vs_cpu_stats *ip_vs_dest_stats;
-		ip_vs_dest_stats = per_cpu_ptr(dest->stats.cpustats, i);
-		u64_stats_init(&ip_vs_dest_stats->syncp);
-	}
 
 	dest->af = svc->af;
 	dest->protocol = svc->protocol;
@@ -1011,6 +998,16 @@ ip_vs_edit_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest)
 	return 0;
 }
 
+static void ip_vs_dest_wait_readers(struct rcu_head *head)
+{
+	struct ip_vs_dest *dest = container_of(head, struct ip_vs_dest,
+					       rcu_head);
+
+	/* End of grace period after unlinking */
+	clear_bit(IP_VS_DEST_STATE_REMOVING, &dest->state);
+}
+
+
 /*
  *	Delete a destination (must be already unlinked from the service)
  */
@@ -1026,16 +1023,20 @@ static void __ip_vs_del_dest(struct net *net, struct ip_vs_dest *dest,
 	 */
 	ip_vs_rs_unhash(dest);
 
+	if (!cleanup) {
+		set_bit(IP_VS_DEST_STATE_REMOVING, &dest->state);
+		call_rcu(&dest->rcu_head, ip_vs_dest_wait_readers);
+	}
+
 	spin_lock_bh(&ipvs->dest_trash_lock);
 	IP_VS_DBG_BUF(3, "Moving dest %s:%u into trash, dest->refcnt=%d\n",
 		      IP_VS_DBG_ADDR(dest->af, &dest->addr), ntohs(dest->port),
 		      atomic_read(&dest->refcnt));
 	if (list_empty(&ipvs->dest_trash) && !cleanup)
 		mod_timer(&ipvs->dest_trash_timer,
-			  jiffies + (IP_VS_DEST_TRASH_PERIOD >> 1));
+			  jiffies + IP_VS_DEST_TRASH_PERIOD);
 	/* dest lives in trash without reference */
 	list_add(&dest->t_list, &ipvs->dest_trash);
-	dest->idle_start = 0;
 	spin_unlock_bh(&ipvs->dest_trash_lock);
 	ip_vs_dest_put(dest);
 }
@@ -1107,30 +1108,24 @@ static void ip_vs_dest_trash_expire(unsigned long data)
 	struct net *net = (struct net *) data;
 	struct netns_ipvs *ipvs = net_ipvs(net);
 	struct ip_vs_dest *dest, *next;
-	unsigned long now = jiffies;
 
 	spin_lock(&ipvs->dest_trash_lock);
 	list_for_each_entry_safe(dest, next, &ipvs->dest_trash, t_list) {
+		/* Skip if dest is in grace period */
+		if (test_bit(IP_VS_DEST_STATE_REMOVING, &dest->state))
+			continue;
 		if (atomic_read(&dest->refcnt) > 0)
 			continue;
-		if (dest->idle_start) {
-			if (time_before(now, dest->idle_start +
-					     IP_VS_DEST_TRASH_PERIOD))
-				continue;
-		} else {
-			dest->idle_start = max(1UL, now);
-			continue;
-		}
 		IP_VS_DBG_BUF(3, "Removing destination %u/%s:%u from trash\n",
 			      dest->vfwmark,
-			      IP_VS_DBG_ADDR(dest->af, &dest->addr),
+			      IP_VS_DBG_ADDR(dest->svc->af, &dest->addr),
 			      ntohs(dest->port));
 		list_del(&dest->t_list);
 		ip_vs_dest_free(dest);
 	}
 	if (!list_empty(&ipvs->dest_trash))
 		mod_timer(&ipvs->dest_trash_timer,
-			  jiffies + (IP_VS_DEST_TRASH_PERIOD >> 1));
+			  jiffies + IP_VS_DEST_TRASH_PERIOD);
 	spin_unlock(&ipvs->dest_trash_lock);
 }
 
@@ -1141,7 +1136,7 @@ static int
 ip_vs_add_service(struct net *net, struct ip_vs_service_user_kern *u,
 		  struct ip_vs_service **svc_p)
 {
-	int ret = 0, i;
+	int ret = 0;
 	struct ip_vs_scheduler *sched = NULL;
 	struct ip_vs_pe *pe = NULL;
 	struct ip_vs_service *svc = NULL;
@@ -1193,13 +1188,6 @@ ip_vs_add_service(struct net *net, struct ip_vs_service_user_kern *u,
 		ret = -ENOMEM;
 		goto out_err;
 	}
-
-	for_each_possible_cpu(i) {
-		struct ip_vs_cpu_stats *ip_vs_stats;
-		ip_vs_stats = per_cpu_ptr(svc->stats.cpustats, i);
-		u64_stats_init(&ip_vs_stats->syncp);
-	}
-
 
 	/* I'm the first user of the service */
 	atomic_set(&svc->refcnt, 0);
@@ -1346,6 +1334,14 @@ out:
 	return ret;
 }
 
+static void ip_vs_service_rcu_free(struct rcu_head *head)
+{
+	struct ip_vs_service *svc;
+
+	svc = container_of(head, struct ip_vs_service, rcu_head);
+	ip_vs_service_free(svc);
+}
+
 /*
  *	Delete a service from the service list
  *	- The service must be unlinked, unlocked and not referenced!
@@ -1394,7 +1390,13 @@ static void __ip_vs_del_service(struct ip_vs_service *svc, bool cleanup)
 	/*
 	 *    Free the service if nobody refers to it
 	 */
-	__ip_vs_svc_put(svc, true);
+	if (atomic_dec_and_test(&svc->refcnt)) {
+		IP_VS_DBG_BUF(3, "Removing service %u/%s:%u\n",
+			      svc->fwmark,
+			      IP_VS_DBG_ADDR(svc->af, &svc->addr),
+			      ntohs(svc->port));
+		call_rcu(&svc->rcu_head, ip_vs_service_rcu_free);
+	}
 
 	/* decrease the module use count */
 	ip_vs_use_count_dec();
@@ -1727,16 +1729,10 @@ static struct ctl_table vs_vars[] = {
 		.proc_handler	= &proc_do_sync_ports,
 	},
 	{
-		.procname	= "sync_persist_mode",
+		.procname	= "sync_qlen_max",
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "sync_qlen_max",
-		.maxlen		= sizeof(unsigned long),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "sync_sock_size",
@@ -1752,18 +1748,6 @@ static struct ctl_table vs_vars[] = {
 	},
 	{
 		.procname	= "expire_nodest_conn",
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "sloppy_tcp",
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "sloppy_sctp",
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
@@ -1809,6 +1793,12 @@ static struct ctl_table vs_vars[] = {
 	},
 	{
 		.procname	= "backup_only",
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "conn_reuse_mode",
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
@@ -2417,19 +2407,12 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 		}
 	}
 
-	if ((cmd == IP_VS_SO_SET_ADD || cmd == IP_VS_SO_SET_EDIT) &&
-	    strnlen(usvc.sched_name, IP_VS_SCHEDNAME_MAXLEN) ==
-	    IP_VS_SCHEDNAME_MAXLEN) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
-
 	/* Check for valid protocol: TCP or UDP or SCTP, even for fwmark!=0 */
 	if (usvc.protocol != IPPROTO_TCP && usvc.protocol != IPPROTO_UDP &&
 	    usvc.protocol != IPPROTO_SCTP) {
-		pr_err("set_ctl: invalid protocol: %d %pI4:%d\n",
+		pr_err("set_ctl: invalid protocol: %d %pI4:%d %s\n",
 		       usvc.protocol, &usvc.addr.ip,
-		       ntohs(usvc.port));
+		       ntohs(usvc.port), usvc.sched_name);
 		ret = -EFAULT;
 		goto out_unlock;
 	}
@@ -2852,7 +2835,7 @@ static const struct nla_policy ip_vs_cmd_policy[IPVS_CMD_ATTR_MAX + 1] = {
 static const struct nla_policy ip_vs_daemon_policy[IPVS_DAEMON_ATTR_MAX + 1] = {
 	[IPVS_DAEMON_ATTR_STATE]	= { .type = NLA_U32 },
 	[IPVS_DAEMON_ATTR_MCAST_IFN]	= { .type = NLA_NUL_STRING,
-					    .len = IP_VS_IFNAME_MAXLEN - 1 },
+					    .len = IP_VS_IFNAME_MAXLEN },
 	[IPVS_DAEMON_ATTR_SYNC_ID]	= { .type = NLA_U32 },
 };
 
@@ -2865,7 +2848,7 @@ static const struct nla_policy ip_vs_svc_policy[IPVS_SVC_ATTR_MAX + 1] = {
 	[IPVS_SVC_ATTR_PORT]		= { .type = NLA_U16 },
 	[IPVS_SVC_ATTR_FWMARK]		= { .type = NLA_U32 },
 	[IPVS_SVC_ATTR_SCHED_NAME]	= { .type = NLA_NUL_STRING,
-					    .len = IP_VS_SCHEDNAME_MAXLEN - 1 },
+					    .len = IP_VS_SCHEDNAME_MAXLEN },
 	[IPVS_SVC_ATTR_PE_NAME]		= { .type = NLA_NUL_STRING,
 					    .len = IP_VS_PENAME_MAXLEN },
 	[IPVS_SVC_ATTR_FLAGS]		= { .type = NLA_BINARY,
@@ -2982,7 +2965,8 @@ static int ip_vs_genl_dump_service(struct sk_buff *skb,
 	if (ip_vs_genl_fill_service(skb, svc) < 0)
 		goto nla_put_failure;
 
-	return genlmsg_end(skb, hdr);
+	genlmsg_end(skb, hdr);
+	return 0;
 
 nla_put_failure:
 	genlmsg_cancel(skb, hdr);
@@ -3027,6 +3011,17 @@ nla_put_failure:
 	return skb->len;
 }
 
+static bool ip_vs_is_af_valid(int af)
+{
+	if (af == AF_INET)
+		return true;
+#ifdef CONFIG_IP_VS_IPV6
+	if (af == AF_INET6 && ipv6_mod_enabled())
+		return true;
+#endif
+	return false;
+}
+
 static int ip_vs_genl_parse_service(struct net *net,
 				    struct ip_vs_service_user_kern *usvc,
 				    struct nlattr *nla, int full_entry,
@@ -3053,11 +3048,7 @@ static int ip_vs_genl_parse_service(struct net *net,
 	memset(usvc, 0, sizeof(*usvc));
 
 	usvc->af = nla_get_u16(nla_af);
-#ifdef CONFIG_IP_VS_IPV6
-	if (usvc->af != AF_INET && usvc->af != AF_INET6)
-#else
-	if (usvc->af != AF_INET)
-#endif
+	if (!ip_vs_is_af_valid(usvc->af))
 		return -EAFNOSUPPORT;
 
 	if (nla_fwmark) {
@@ -3173,7 +3164,8 @@ static int ip_vs_genl_dump_dest(struct sk_buff *skb, struct ip_vs_dest *dest,
 	if (ip_vs_genl_fill_dest(skb, dest) < 0)
 		goto nla_put_failure;
 
-	return genlmsg_end(skb, hdr);
+	genlmsg_end(skb, hdr);
+	return 0;
 
 nla_put_failure:
 	genlmsg_cancel(skb, hdr);
@@ -3302,7 +3294,8 @@ static int ip_vs_genl_dump_daemon(struct sk_buff *skb, __u32 state,
 	if (ip_vs_genl_fill_daemon(skb, state, mcast_ifn, syncid))
 		goto nla_put_failure;
 
-	return genlmsg_end(skb, hdr);
+	genlmsg_end(skb, hdr);
+	return 0;
 
 nla_put_failure:
 	genlmsg_cancel(skb, hdr);
@@ -3607,7 +3600,7 @@ out:
 }
 
 
-static const struct genl_ops ip_vs_genl_ops[] = {
+static const struct genl_ops ip_vs_genl_ops[] __read_mostly = {
 	{
 		.cmd	= IPVS_CMD_NEW_SERVICE,
 		.flags	= GENL_ADMIN_PERM,
@@ -3759,15 +3752,12 @@ static int __net_init ip_vs_control_net_init_sysctl(struct net *net)
 	tbl[idx++].data = &ipvs->sysctl_sync_ver;
 	ipvs->sysctl_sync_ports = 1;
 	tbl[idx++].data = &ipvs->sysctl_sync_ports;
-	tbl[idx++].data = &ipvs->sysctl_sync_persist_mode;
 	ipvs->sysctl_sync_qlen_max = nr_free_buffer_pages() / 32;
 	tbl[idx++].data = &ipvs->sysctl_sync_qlen_max;
 	ipvs->sysctl_sync_sock_size = 0;
 	tbl[idx++].data = &ipvs->sysctl_sync_sock_size;
 	tbl[idx++].data = &ipvs->sysctl_cache_bypass;
 	tbl[idx++].data = &ipvs->sysctl_expire_nodest_conn;
-	tbl[idx++].data = &ipvs->sysctl_sloppy_tcp;
-	tbl[idx++].data = &ipvs->sysctl_sloppy_sctp;
 	tbl[idx++].data = &ipvs->sysctl_expire_quiescent_template;
 	ipvs->sysctl_sync_threshold[0] = DEFAULT_SYNC_THRESHOLD;
 	ipvs->sysctl_sync_threshold[1] = DEFAULT_SYNC_PERIOD;
@@ -3781,6 +3771,8 @@ static int __net_init ip_vs_control_net_init_sysctl(struct net *net)
 	ipvs->sysctl_pmtu_disc = 1;
 	tbl[idx++].data = &ipvs->sysctl_pmtu_disc;
 	tbl[idx++].data = &ipvs->sysctl_backup_only;
+	ipvs->sysctl_conn_reuse_mode = 1;
+	tbl[idx++].data = &ipvs->sysctl_conn_reuse_mode;
 
 
 	ipvs->sysctl_hdr = register_net_sysctl(net, "net/ipv4/vs", tbl);
@@ -3805,10 +3797,6 @@ static void __net_exit ip_vs_control_net_cleanup_sysctl(struct net *net)
 	cancel_delayed_work_sync(&ipvs->defense_work);
 	cancel_work_sync(&ipvs->defense_work.work);
 	unregister_net_sysctl_table(ipvs->sysctl_hdr);
-	ip_vs_stop_estimator(net, &ipvs->tot_stats);
-
-	if (!net_eq(net, &init_net))
-		kfree(ipvs->sysctl_tbl);
 }
 
 #else
@@ -3824,7 +3812,7 @@ static struct notifier_block ip_vs_dst_notifier = {
 
 int __net_init ip_vs_control_net_init(struct net *net)
 {
-	int i, idx;
+	int idx;
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
 	/* Initialize rs_table */
@@ -3842,12 +3830,6 @@ int __net_init ip_vs_control_net_init(struct net *net)
 	ipvs->tot_stats.cpustats = alloc_percpu(struct ip_vs_cpu_stats);
 	if (!ipvs->tot_stats.cpustats)
 		return -ENOMEM;
-
-	for_each_possible_cpu(i) {
-		struct ip_vs_cpu_stats *ipvs_tot_stats;
-		ipvs_tot_stats = per_cpu_ptr(ipvs->tot_stats.cpustats, i);
-		u64_stats_init(&ipvs_tot_stats->syncp);
-	}
 
 	spin_lock_init(&ipvs->tot_stats.lock);
 
@@ -3870,7 +3852,12 @@ void __net_exit ip_vs_control_net_cleanup(struct net *net)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
+	/* Some dest can be in grace period even before cleanup, we have to
+	 * defer ip_vs_trash_cleanup until ip_vs_dest_wait_readers is called.
+	 */
+	rcu_barrier();
 	ip_vs_trash_cleanup(net);
+	ip_vs_stop_estimator(net, &ipvs->tot_stats);
 	ip_vs_control_net_cleanup_sysctl(net);
 	remove_proc_entry("ip_vs_stats_percpu", net->proc_net);
 	remove_proc_entry("ip_vs_stats", net->proc_net);
@@ -3922,7 +3909,7 @@ int __init ip_vs_control_init(void)
 
 	smp_wmb();	/* Do we really need it now ? */
 
-	ret = register_netdevice_notifier(&ip_vs_dst_notifier);
+	ret = register_netdevice_notifier_rh(&ip_vs_dst_notifier);
 	if (ret < 0)
 		return ret;
 
@@ -3934,6 +3921,6 @@ int __init ip_vs_control_init(void)
 void ip_vs_control_cleanup(void)
 {
 	EnterFunction(2);
-	unregister_netdevice_notifier(&ip_vs_dst_notifier);
+	unregister_netdevice_notifier_rh(&ip_vs_dst_notifier);
 	LeaveFunction(2);
 }
