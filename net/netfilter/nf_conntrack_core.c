@@ -1454,15 +1454,42 @@ void nf_ct_iterate_cleanup(struct net *net,
 			   void *data, u32 portid, int report)
 {
 	struct nf_conn *ct;
+    struct nf_conn_counter *acct;
+    struct nf_info {
+        struct nf_conn_counter acct[IP_CT_DIR_MAX];
+        u64 cht[2][2];
+    };
+    struct nf_info *info;
+    u64 bytes, packets;
 	unsigned int bucket = 0;
 
 	while ((ct = get_next_corpse(net, iter, data, &bucket)) != NULL) {
+        acct = nf_conn_acct_find(ct);
+        info = (struct nf_info *)acct;
+        {
+            bytes = atomic64_read(&acct[0].bytes);
+            atomic64_xchg(&acct[0].bytes, bytes + info->cht[0][0]);
+            packets = atomic64_read(&acct[0].packets);
+            atomic64_xchg(&acct[0].packets, packets + info->cht[0][1]);
+            info->cht[0][0] = 0;
+            info->cht[0][1] = 0;
+        }
+        {
+            bytes = atomic64_read(&acct[1].bytes);
+            atomic64_xchg(&acct[1].bytes, bytes + info->cht[1][0]);
+            packets = atomic64_read(&acct[1].packets);
+            atomic64_xchg(&acct[1].packets, packets + info->cht[1][1]);
+            info->cht[1][0] = 0;
+            info->cht[1][1] = 0;
+        }
+
+
 		/* Time to push up daises... */
 		if (del_timer(&ct->timeout))
 			nf_ct_delete(ct, portid, report);
 
 		/* ... else the timer will get him soon. */
-
+        
 		nf_ct_put(ct);
 	}
 }

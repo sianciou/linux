@@ -254,15 +254,23 @@ ctnetlink_dump_counters(struct sk_buff *skb, const struct nf_conn *ct,
 			enum ip_conntrack_dir dir, int type)
 {
 	struct nf_conn_counter *acct;
+    struct nf_info {
+        struct nf_conn_counter acct[IP_CT_DIR_MAX];
+        u64 cht[2][2];
+    };
+    struct nf_info *info;
 	u64 pkts, bytes;
 
 	acct = nf_conn_acct_find(ct);
 	if (!acct)
 		return 0;
+    info = (struct nf_info *)acct;
 
 	if (type == IPCTNL_MSG_CT_GET_CTRZERO) {
 		pkts = atomic64_xchg(&acct[dir].packets, 0);
 		bytes = atomic64_xchg(&acct[dir].bytes, 0);
+        info->cht[dir][0] += bytes;
+        info->cht[dir][1] += pkts;
 	} else {
 		pkts = atomic64_read(&acct[dir].packets);
 		bytes = atomic64_read(&acct[dir].bytes);
@@ -1084,6 +1092,13 @@ ctnetlink_del_conntrack(struct sock *ctnl, struct sk_buff *skb,
 	u_int8_t u3 = nfmsg->nfgen_family;
 	struct nf_conntrack_zone zone;
 	int err;
+    struct nf_conn_counter *acct;
+    struct nf_info {
+        struct nf_conn_counter acct[IP_CT_DIR_MAX];
+        u64 cht[2][2];
+    };
+    struct nf_info *info;
+    u64 bytes, packets;
 
 	err = ctnetlink_parse_zone(cda[CTA_ZONE], &zone);
 	if (err < 0)
@@ -1112,6 +1127,27 @@ ctnetlink_del_conntrack(struct sock *ctnl, struct sk_buff *skb,
 
 	ct = nf_ct_tuplehash_to_ctrack(h);
 
+    acct = nf_conn_acct_find(ct);
+    if(!acct)   return 0;
+    info = (struct nf_info *)acct;
+    {
+        bytes = atomic64_read(&acct[0].bytes);
+        atomic64_xchg(&acct[0].bytes, bytes + info->cht[0][0]);
+        packets = atomic64_read(&acct[0].packets);
+        atomic64_xchg(&acct[0].packets, packets + info->cht[0][1]);
+        info->cht[0][0] = 0;
+        info->cht[0][1] = 0;
+    }
+
+    {
+        bytes = atomic64_read(&acct[1].bytes);
+        atomic64_xchg(&acct[1].bytes, bytes + info->cht[1][0]);
+        packets = atomic64_read(&acct[1].packets);
+        atomic64_xchg(&acct[1].packets, packets + info->cht[1][1]);
+        info->cht[1][0] = 0;
+        info->cht[1][1] = 0;
+    }
+
 	if (cda[CTA_ID]) {
 		u_int32_t id = ntohl(nla_get_be32(cda[CTA_ID]));
 		if (id != (u32)(unsigned long)ct) {
@@ -1121,7 +1157,7 @@ ctnetlink_del_conntrack(struct sock *ctnl, struct sk_buff *skb,
 	}
 
 	if (del_timer(&ct->timeout))
-		nf_ct_delete(ct, NETLINK_CB(skb).portid, nlmsg_report(nlh));
+        nf_ct_delete(ct, NETLINK_CB(skb).portid, nlmsg_report(nlh));
 
 	nf_ct_put(ct);
 

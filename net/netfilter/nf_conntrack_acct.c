@@ -51,9 +51,14 @@ seq_print_acct(struct seq_file *s, const struct nf_conn *ct, int dir)
 };
 EXPORT_SYMBOL_GPL(seq_print_acct);
 
+struct info_compat {
+    struct nf_conn_counter nc[IP_CT_DIR_MAX];
+    u64 cht[2][2];
+};
+
 static struct nf_ct_ext_type acct_extend __read_mostly = {
-	.len	= sizeof(struct nf_conn_counter[IP_CT_DIR_MAX]),
-	.align	= __alignof__(struct nf_conn_counter[IP_CT_DIR_MAX]),
+    .len    = sizeof(struct info_compat),
+    .align  = __alignof__(struct info_compat),
 	.id	= NF_CT_EXT_ACCT,
 };
 
